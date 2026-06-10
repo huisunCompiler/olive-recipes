@@ -9,6 +9,8 @@ devices:
 recipes:
   - name: flux2-klein-4b-text-encoder
     file: config_text_encoder.json
+  - name: flux2-klein-4b-text-encoder-genai
+    file: config_text_encoder_genai.json
   - name: flux2-klein-4b-transformer
     file: config_transformer.json
   - name: flux2-klein-4b-vae-decoder

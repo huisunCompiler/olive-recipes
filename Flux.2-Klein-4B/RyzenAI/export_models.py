@@ -33,6 +33,11 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 DEFAULT_MODEL_ID   = "black-forest-labs/FLUX.2-klein-4B"
 DEFAULT_RESOLUTIONS = ["1024x1024"]
 ALL_MODELS = ["transformer", "vae_decoder", "text_encoder"]
+TEXT_ENCODER_BACKENDS = {
+    "olive": "config_text_encoder.json",
+    "genai": "config_text_encoder_genai.json",
+}
+DEFAULT_TEXT_ENCODER_BACKEND = "olive"
 
 NON_ONNX_COMPONENTS = ["tokenizer", "tokenizer_2", "scheduler", "feature_extractor"]
 
@@ -64,9 +69,31 @@ def _fmt_seconds(seconds: float) -> str:
     return f"{s}s"
 
 
-def update_config_files(model_id: str | None, resolutions: list[str] | None) -> None:
-    for name in ALL_MODELS:
-        config_path = SCRIPT_DIR / f"config_{name}.json"
+def _text_encoder_config_path(backend: str) -> Path:
+    if backend not in TEXT_ENCODER_BACKENDS:
+        raise ValueError(
+            f"Unknown text encoder backend '{backend}'. Choices: {', '.join(TEXT_ENCODER_BACKENDS)}"
+        )
+    return SCRIPT_DIR / TEXT_ENCODER_BACKENDS[backend]
+
+
+def _config_paths_for_update(models: list[str], text_encoder_backend: str) -> list[Path]:
+    paths: list[Path] = []
+    for name in models:
+        if name == "text_encoder":
+            paths.append(_text_encoder_config_path(text_encoder_backend))
+        else:
+            paths.append(SCRIPT_DIR / f"config_{name}.json")
+    return paths
+
+
+def update_config_files(
+    model_id: str | None,
+    resolutions: list[str] | None,
+    models: list[str],
+    text_encoder_backend: str,
+) -> None:
+    for config_path in _config_paths_for_update(models, text_encoder_backend):
         if not config_path.exists():
             continue
         with config_path.open() as f:
@@ -88,8 +115,11 @@ def update_config_files(model_id: str | None, resolutions: list[str] | None) -> 
             print(f"  [CONFIG] Updated {config_path.name}")
 
 
-def load_olive_config(submodel_name: str) -> dict:
-    config_path = SCRIPT_DIR / f"config_{submodel_name}.json"
+def load_olive_config(submodel_name: str, text_encoder_backend: str = DEFAULT_TEXT_ENCODER_BACKEND) -> dict:
+    if submodel_name == "text_encoder":
+        config_path = _text_encoder_config_path(text_encoder_backend)
+    else:
+        config_path = SCRIPT_DIR / f"config_{submodel_name}.json"
     with config_path.open() as f:
         return json.load(f)
 
@@ -105,17 +135,30 @@ def _read_footprint(footprints_dir: Path, submodel_name: str) -> tuple[Path, Pat
 
     conversion_node = None
     optimized_node  = None
+    modelbuilder_node = None
     for node in footprints.values():
         from_pass = (node.get("from_pass") or "").lower()
         if from_pass == "onnxconversion":
             conversion_node = node
+        elif from_pass == "modelbuilder":
+            modelbuilder_node = node
         else:
             optimized_node = node
 
     if conversion_node is None:
-        raise RuntimeError(
-            f"OnnxConversion footprint node not found for '{submodel_name}' in {fp_path}."
-        )
+        if modelbuilder_node is not None:
+            conversion_node = modelbuilder_node
+            optimized_node = modelbuilder_node
+        elif optimized_node is not None:
+            print(
+                f"  [WARN] OnnxConversion footprint node not found for '{submodel_name}'; "
+                "using last optimization pass output."
+            )
+            conversion_node = optimized_node
+        else:
+            raise RuntimeError(
+                f"OnnxConversion footprint node not found for '{submodel_name}' in {fp_path}."
+            )
     # CPU-only models (text_encoder, vae_encoder) have no optimization pass;
     # the conversion output is the final artifact.
     if optimized_node is None:
@@ -331,7 +374,10 @@ def optimize(args) -> dict[str, bool]:
 
     for submodel_name in args.models:
         print(f"\n{'=' * 60}\n  Exporting: {submodel_name}\n{'=' * 60}")
-        olive_config = load_olive_config(submodel_name)
+        backend = args.text_encoder_backend if submodel_name == "text_encoder" else DEFAULT_TEXT_ENCODER_BACKEND
+        if submodel_name == "text_encoder":
+            print(f"  text_encoder backend: {backend} ({TEXT_ENCODER_BACKENDS[backend]})")
+        olive_config = load_olive_config(submodel_name, text_encoder_backend=backend)
         t0 = time.monotonic()
         try:
             olive_run(olive_config)
@@ -372,6 +418,7 @@ def parse_args(raw_args=None) -> argparse.Namespace:
             "  python export_models.py\n"
             "  python export_models.py --models transformer\n"
             "  python export_models.py --model_id /local/path/to/model\n"
+            "  python export_models.py --models text_encoder --text_encoder_backend genai\n"
             "  python export_models.py --output_dir /data/flux2_klein_onnx"
         ),
     )
@@ -399,6 +446,16 @@ def parse_args(raw_args=None) -> argparse.Namespace:
         "--output_dir", default=str(SCRIPT_DIR / "output_model"), type=str,
         help="Assembled pipeline output directory. Default: <script_dir>/output_model",
     )
+    parser.add_argument(
+        "--text_encoder_backend",
+        choices=sorted(TEXT_ENCODER_BACKENDS),
+        default=DEFAULT_TEXT_ENCODER_BACKEND,
+        help=(
+            "Text encoder export backend. 'olive' uses OnnxConversion + ORT optimization "
+            "(default). 'genai' uses Olive ModelBuilder with prompt_embeds export "
+            "(requires CUDA GPU and matching onnxruntime-genai / Olive PR changes)."
+        ),
+    )
     return parser.parse_args(raw_args)
 
 
@@ -413,7 +470,7 @@ def main(raw_args=None) -> None:
 
     if args.model_id is not None or args.resolutions is not None:
         print("\n[CONFIG] Syncing config_*.json ...")
-        update_config_files(args.model_id, args.resolutions)
+        update_config_files(args.model_id, args.resolutions, args.models, args.text_encoder_backend)
 
     if args.model_id is None:
         first_cfg_path = SCRIPT_DIR / f"config_{args.models[0]}.json"
@@ -438,6 +495,8 @@ def main(raw_args=None) -> None:
     print("=" * 60)
     print(f"  model_id    : {args.model_id}")
     print(f"  sub-models  : {', '.join(args.models)}")
+    if "text_encoder" in args.models:
+        print(f"  text_encoder: {args.text_encoder_backend} ({TEXT_ENCODER_BACKENDS[args.text_encoder_backend]})")
     print(f"  resolutions : {', '.join(args.resolutions)}")
     print(f"  output_dir  : {args.output_dir}")
     print("=" * 60)

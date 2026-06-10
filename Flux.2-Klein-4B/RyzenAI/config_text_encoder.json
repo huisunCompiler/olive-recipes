@@ -1,17 +1,35 @@
 {
     "input_model": {
         "type": "PyTorchModel",
-        "model_path": "black-forest-labs/FLUX.2-klein-4B",
+        "model_path": "/scratch/huisu/Qwen3-4B/Qwen3-4B/",
         "model_loader": "text_encoder_load",
         "model_script": "user_script.py",
         "io_config": {
-            "input_names": ["input_ids", "attention_mask", "position_ids"],
-            "output_names": ["prompt_embeds"],
+            "input_names": [
+                "input_ids",
+                "attention_mask",
+                "position_ids"
+            ],
+            "output_names": [
+                "prompt_embeds"
+            ],
             "dynamic_axes": {
-                "input_ids":      {"0": "batch", "1": "sequence"},
-                "attention_mask": {"0": "batch", "1": "sequence"},
-                "position_ids":   {"0": "batch", "1": "sequence"},
-                "prompt_embeds":  {"0": "batch", "1": "sequence"}
+                "input_ids": {
+                    "0": "batch",
+                    "1": "sequence"
+                },
+                "attention_mask": {
+                    "0": "batch",
+                    "1": "sequence"
+                },
+                "position_ids": {
+                    "0": "batch",
+                    "1": "sequence"
+                },
+                "prompt_embeds": {
+                    "0": "batch",
+                    "1": "sequence"
+                }
             }
         },
         "dummy_inputs_func": "text_encoder_conversion_inputs"
@@ -19,7 +37,14 @@
     "systems": {
         "local_system": {
             "type": "LocalSystem",
-            "accelerators": [{"device": "cpu", "execution_providers": ["CPUExecutionProvider"]}]
+            "accelerators": [
+                {
+                    "device": "cpu",
+                    "execution_providers": [
+                        "CPUExecutionProvider"
+                    ]
+                }
+            ]
         }
     },
     "passes": {
@@ -62,8 +87,14 @@
         },
         "dynamic_shape_to_fixed": {
             "type": "DynamicToFixedShape",
-            "dim_param": [ "batch", "sequence" ],
-            "dim_value": [ 1, 256 ]
+            "dim_param": [
+                "batch",
+                "sequence"
+            ],
+            "dim_value": [
+                1,
+                256
+            ]
         },
         "int4": {
             "type": "OnnxBlockWiseRtnQuantization",

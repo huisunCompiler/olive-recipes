@@ -1,0 +1,81 @@
+{
+    "input_model": {
+        "type": "HfModel",
+        "model_path": "black-forest-labs/FLUX.2-klein-4B",
+        "task": "text-generation",
+        "load_kwargs": {
+            "trust_remote_code": true,
+            "extra_args": {
+                "subfolder": "text_encoder"
+            }
+        }
+    },
+    "systems": {
+        "local_system": {
+            "type": "LocalSystem",
+            "accelerators": [
+                {
+                    "device": "gpu",
+                    "execution_providers": ["CUDAExecutionProvider"]
+                }
+            ]
+        }
+    },
+    "host": "local_system",
+    "target": "local_system",
+    "data_configs": [
+        {
+            "name": "wikitext2_train",
+            "type": "HuggingfaceContainer",
+            "load_dataset_config": {
+                "data_name": "wikitext",
+                "subset": "wikitext-2-raw-v1",
+                "split": "train"
+            },
+            "pre_process_data_config": {
+                "strategy": "line-by-line",
+                "add_special_tokens": true,
+                "max_samples": 128,
+                "max_seq_len": 512
+            }
+        }
+    ],
+    "passes": {
+        "smp": {
+            "type": "SelectiveMixedPrecision",
+            "algorithm": "kld_gradient",
+            "bits": 4,
+            "group_size": 128,
+            "sym": false,
+            "high_bits": 8,
+            "ratio": 0.85,
+            "kld_memory_mode": "auto"
+        },
+        "gptq": {
+            "type": "Gptq",
+            "bits": 4,
+            "group_size": 128,
+            "sym": false,
+            "lm_head": false,
+            "embeds": true,
+            "data_config": "wikitext2_train"
+        },
+        "mb": {
+            "type": "ModelBuilder",
+            "precision": "int4",
+            "int4_block_size": 128,
+            "int4_accuracy_level": 2,
+            "int4_op_types_to_quantize": ["MatMul"],
+            "exclude_lm_head": true,
+            "use_cache": false,
+            "hidden_states_layers": [9, 18, 27],
+            "extra_options": {
+                "filename": "model.onnx"
+            }
+        }
+    },
+    "log_severity_level": 0,
+    "evaluate_input_model": false,
+    "cache_dir": "ryzenai_cache",
+    "output_dir": "footprints/text_encoder"
+}
