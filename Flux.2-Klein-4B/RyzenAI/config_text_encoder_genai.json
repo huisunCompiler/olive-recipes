@@ -1,7 +1,7 @@
 {
     "input_model": {
         "type": "HfModel",
-        "model_path": "black-forest-labs/FLUX.2-klein-4B",
+        "model_path": "D:\\olive\\Flux.2-klein-4B",
         "task": "text-generation",
         "load_kwargs": {
             "trust_remote_code": true,
@@ -16,7 +16,9 @@
             "accelerators": [
                 {
                     "device": "gpu",
-                    "execution_providers": ["CUDAExecutionProvider"]
+                    "execution_providers": [
+                        "DmlExecutionProvider"
+                    ]
                 }
             ]
         }
@@ -65,10 +67,16 @@
             "precision": "int4",
             "int4_block_size": 128,
             "int4_accuracy_level": 2,
-            "int4_op_types_to_quantize": ["MatMul"],
+            "int4_op_types_to_quantize": [
+                "MatMul"
+            ],
             "exclude_lm_head": true,
             "use_cache": false,
-            "hidden_states_layers": [9, 18, 27],
+            "hidden_states_layers": [
+                9,
+                18,
+                27
+            ],
             "extra_options": {
                 "filename": "model.onnx"
             }
