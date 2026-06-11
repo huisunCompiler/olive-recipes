@@ -53,8 +53,6 @@ The script will:
 |---|---|---|
 | `--model_id` | value stored in `config_transformer.json` / `config_vae_decoder.json`, or HF default when exporting text encoder alone | HuggingFace model ID or local path. Written back to those config files when set. |
 | `--models` | all | Sub-models to export. Choices: `transformer vae_decoder text_encoder` |
-| `--text_encoder_backend` | `genai` | Only supported value: ModelBuilder fp16 → MatMulNBits INT4. |
-| `--text_encoder_fp16_onnx` | (unset) | Skip ModelBuilder and quantize this fp16 `model.onnx` to INT4 only. |
 | `--resolutions` | `1024x1024` | NPU compilation resolution(s). Written back to `config_transformer.json` and `config_vae_decoder.json`. |
 | `--output_dir` | `./output_model` | Destination for the assembled pipeline directory. |
 
@@ -68,17 +66,13 @@ python export_models.py --model_id D:/models/FLUX.2-klein-4B
 # Change output directory
 python export_models.py --output_dir D:/output/flux2_klein
 
-# Export text encoder only (genai path; no extra flags)
+# Export text encoder only
 python export_models.py --model_id /path/to/FLUX.2-klein-4B --models text_encoder
-
-# Optional: you already have a fp16 model.onnx from a manual ModelBuilder run
-python export_models.py --model_id /path/to/FLUX.2-klein-4B --models text_encoder \
-  --text_encoder_fp16_onnx /path/to/model.onnx
 ```
 
 ### Text encoder (genai)
 
-The text encoder export uses `recipes/qwen3-4b-fp16-prompt-embeds-modelbuilder.json` (CUDA EP) for fp16 `prompt_embeds`, then `quantize_matmul_4bits` → `MatMulNBits` (block 128). Use `--text_encoder_fp16_onnx` if you build fp16 ONNX on another machine.
+The text encoder export uses `recipes/qwen3-4b-fp16-prompt-embeds-modelbuilder.json` (CUDA EP) for fp16 `prompt_embeds`, then `quantize_matmul_4bits` → `MatMulNBits` (block 128).
 
 Exports `prompt_embeds` with shape `[batch, sequence, 7680]`.
 

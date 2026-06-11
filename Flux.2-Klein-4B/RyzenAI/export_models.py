@@ -212,28 +212,18 @@ def _run_fp16_prompt_embed_modelbuilder(staged_model_dir: Path, run_config: Path
     return fp16_onnx
 
 
-def export_text_encoder_matmulnbits(
-    staged_model_dir: Path,
-    *,
-    fp16_onnx_path: Path | None = None,
-) -> Path:
-    """Text encoder: ModelBuilder fp16 (built-in recipe) → MatMulNBits INT4.
-
-    ``fp16_onnx_path``: skip ModelBuilder and quantize this ONNX only.
-    """
+def export_text_encoder_matmulnbits(staged_model_dir: Path) -> Path:
+    """Text encoder: ModelBuilder fp16 (recipe JSON) → MatMulNBits INT4."""
     from text_encoder_matmulnbits import export_prompt_embeds_matmulnbits
 
-    if fp16_onnx_path is not None:
-        resolved_fp16 = fp16_onnx_path
-    else:
-        recipe = (SCRIPT_DIR / "recipes" / "qwen3-4b-fp16-prompt-embeds-modelbuilder.json").resolve()
-        if not recipe.is_file():
-            raise FileNotFoundError(
-                f"Text encoder fp16 recipe not found: {recipe}. "
-                "Restore recipes/ in this package."
-            )
-        print(f"  [TEXT_ENCODER] Using fp16 recipe: {recipe}")
-        resolved_fp16 = _run_fp16_prompt_embed_modelbuilder(staged_model_dir, recipe)
+    recipe = (SCRIPT_DIR / "recipes" / "qwen3-4b-fp16-prompt-embeds-modelbuilder.json").resolve()
+    if not recipe.is_file():
+        raise FileNotFoundError(
+            f"Text encoder fp16 recipe not found: {recipe}. "
+            "Restore recipes/ in this package."
+        )
+    print(f"  [TEXT_ENCODER] Using fp16 recipe: {recipe}")
+    resolved_fp16 = _run_fp16_prompt_embed_modelbuilder(staged_model_dir, recipe)
 
     footprint_dir = SCRIPT_DIR / "footprints" / "text_encoder"
     output_onnx = footprint_dir / "model.onnx"
@@ -548,12 +538,7 @@ def optimize(args) -> dict[str, bool]:
             if submodel_name == "text_encoder":
                 print("  text_encoder: ModelBuilder fp16 → MatMulNBits INT4 (genai)")
                 staged_path = prepare_text_encoder_for_export(resolve_pipeline_root(model_id))
-                fp16_onnx = (
-                    Path(args.text_encoder_fp16_onnx).resolve()
-                    if getattr(args, "text_encoder_fp16_onnx", None)
-                    else None
-                )
-                export_text_encoder_matmulnbits(staged_path, fp16_onnx_path=fp16_onnx)
+                export_text_encoder_matmulnbits(staged_path)
                 success = True
             else:
                 olive_config = load_olive_config(submodel_name)
@@ -596,7 +581,6 @@ def parse_args(raw_args=None) -> argparse.Namespace:
             "  python export_models.py --models transformer\n"
             "  python export_models.py --model_id /local/path/to/model\n"
             "  python export_models.py --models text_encoder\n"
-            "  python export_models.py --models text_encoder --text_encoder_backend genai\n"
             "  python export_models.py --output_dir /data/flux2_klein_onnx"
         ),
     )
@@ -635,21 +619,6 @@ def parse_args(raw_args=None) -> argparse.Namespace:
         default=str(SCRIPT_DIR / "output_model"),
         type=str,
         help="Assembled pipeline output directory. Default: <script_dir>/output_model",
-    )
-    parser.add_argument(
-        "--text_encoder_backend",
-        choices=["genai"],
-        default="genai",
-        help="Text encoder path (only value supported: genai = ModelBuilder fp16 → MatMulNBits INT4).",
-    )
-    parser.add_argument(
-        "--text_encoder_fp16_onnx",
-        default=None,
-        type=str,
-        metavar="PATH",
-        help=(
-            "Use this fp16 model.onnx instead of running ModelBuilder; only MatMul → MatMulNBits INT4."
-        ),
     )
     return parser.parse_args(raw_args)
 
@@ -706,11 +675,8 @@ def main(raw_args=None) -> None:
     print(f"  model_id    : {args.model_id}")
     print(f"  sub-models  : {', '.join(args.models)}")
     if "text_encoder" in args.models:
-        print(f"  text_encoder: {args.text_encoder_backend} (ModelBuilder fp16 → MatMulNBits INT4)")
-        if args.text_encoder_fp16_onnx:
-            print(f"  text_encoder fp16: existing ONNX → {args.text_encoder_fp16_onnx}")
-        else:
-            print("  text_encoder fp16: recipes/qwen3-4b-fp16-prompt-embeds-modelbuilder.json")
+        print("  text_encoder: ModelBuilder fp16 → MatMulNBits INT4")
+        print("  text_encoder fp16: recipes/qwen3-4b-fp16-prompt-embeds-modelbuilder.json")
     print(f"  resolutions : {', '.join(args.resolutions)}")
     print(f"  output_dir  : {args.output_dir}")
     print("=" * 60)
