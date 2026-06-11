@@ -1,10 +1,12 @@
 # FLUX.2-klein-4B — Model Optimization for AMD NPU
 
-This folder contains sample Olive configurations and export script to optimize FLUX.2-klein-4B 2 models for AMD NPU.
+This folder contains Olive workflow JSON for the **transformer** and **VAE decoder** NPU passes, plus an export script that assembles the full diffusers-style pipeline directory.
 
 The export script (`export_models.py`) handles the full pipeline in
 one command: download weights → ONNX conversion → NPU compilation →
 assemble a self-contained output directory (ONNX models + tokenizer + scheduler).
+
+The **text encoder** is exported on a fixed **genai** path: Olive ModelBuilder (fp16, `prompt_embeds`) followed by MatMulNBits INT4 quantization in Python (`text_encoder_matmulnbits.py`). It does not use `config_text_encoder*.json`.
 
 ## Prerequisites
 
@@ -19,8 +21,8 @@ assemble a self-contained output directory (ONNX models + tokenizer + scheduler)
 ## Step 1 — Create the conda environment
 
 ```bash
-conda create -n olive python=3.12 -y
-conda activate olive
+conda create -n flux2_klein_export python=3.12 -y
+conda activate flux2_klein_export
 ```
 
 ## Step 2 — Install model dependencies
@@ -40,7 +42,7 @@ python export_models.py
 The script will:
 
 1. Download and cache the full pipeline weights from HuggingFace (first run only).
-2. Export each sub-model to ONNX via Olive.
+2. Export each sub-model: transformer and VAE decoder via Olive; text encoder via ModelBuilder fp16 → MatMulNBits INT4.
 3. Compile the transformer and VAE decoder for AMD NPU using `VitisGenerateModelSD`.
 4. Assemble the final pipeline directory, including non-ONNX components
    (tokenizer, scheduler).
@@ -49,12 +51,11 @@ The script will:
 
 | Argument | Default | Description |
 |---|---|---|
-| `--model_id` | value stored in `config_*.json` | HuggingFace model ID or local path. Written back to all config files. |
+| `--model_id` | value stored in `config_transformer.json` / `config_vae_decoder.json`, or HF default when exporting text encoder alone | HuggingFace model ID or local path. Written back to those config files when set. |
 | `--models` | all | Sub-models to export. Choices: `transformer vae_decoder text_encoder` |
-| `--text_encoder_backend` | `olive` | Text encoder backend. `olive` = OnnxConversion path; `genai` = built-in Olive fp16 ModelBuilder → MatMulNBits INT4 (see below) |
-| `--text_encoder_fp16_onnx` | (unset) | With `genai` only: skip Olive and quantize this fp16 `model.onnx` to INT4. |
-| `--text_encoder_olive_run_config` | (unset) | With `genai` only: replace the default Olive JSON (otherwise `recipes/qwen3-4b-fp16-prompt-embeds-modelbuilder.json`). |
-| `--resolutions` | `1024x1024` | NPU compilation resolution(s). Written back to all config files. |
+| `--text_encoder_backend` | `genai` | Only supported value: ModelBuilder fp16 → MatMulNBits INT4. |
+| `--text_encoder_fp16_onnx` | (unset) | Skip ModelBuilder and quantize this fp16 `model.onnx` to INT4 only. |
+| `--resolutions` | `1024x1024` | NPU compilation resolution(s). Written back to `config_transformer.json` and `config_vae_decoder.json`. |
 | `--output_dir` | `./output_model` | Destination for the assembled pipeline directory. |
 
 ```bash
@@ -67,23 +68,19 @@ python export_models.py --model_id D:/models/FLUX.2-klein-4B
 # Change output directory
 python export_models.py --output_dir D:/output/flux2_klein
 
-# Export text encoder: built-in Olive ModelBuilder fp16 → MatMulNBits INT4 (no extra flags)
-python export_models.py --model_id /path/to/FLUX.2-klein-4B --models text_encoder --text_encoder_backend genai
+# Export text encoder only (genai path; no extra flags)
+python export_models.py --model_id /path/to/FLUX.2-klein-4B --models text_encoder
 
-# Optional: you already have a fp16 model.onnx from a manual olive run
-python export_models.py --model_id /path/to/FLUX.2-klein-4B --models text_encoder --text_encoder_backend genai \
+# Optional: you already have a fp16 model.onnx from a manual ModelBuilder run
+python export_models.py --model_id /path/to/FLUX.2-klein-4B --models text_encoder \
   --text_encoder_fp16_onnx /path/to/model.onnx
 ```
 
-### Text encoder backends
+### Text encoder (genai)
 
-| Backend | Config | Description |
-|---|---|---|
-| `olive` (default) | `config_text_encoder.json` | PyTorch → OnnxConversion → ORT optimization → block-wise INT4 |
-| `genai` | (none) | Default: run Olive with `recipes/qwen3-4b-fp16-prompt-embeds-modelbuilder.json` on the staged text encoder (CUDA EP in recipe), then `quantize_matmul_4bits` → `MatMulNBits` block 128. Optional `--text_encoder_fp16_onnx` skips Olive; `--text_encoder_olive_run_config` swaps the recipe. |
-| `genai_olive` | `config_text_encoder_genai.json` | Legacy: SelectiveMixedPrecision → GPTQ → ModelBuilder ONNX |
+The text encoder export uses `recipes/qwen3-4b-fp16-prompt-embeds-modelbuilder.json` (CUDA EP) for fp16 `prompt_embeds`, then `quantize_matmul_4bits` → `MatMulNBits` (block 128). Use `--text_encoder_fp16_onnx` if you build fp16 ONNX on another machine.
 
-The `genai` backend exports `prompt_embeds` with shape `[batch, sequence, 7680]`. The built-in recipe uses `CUDAExecutionProvider`; use `--text_encoder_fp16_onnx` if you generate fp16 on another machine.
+Exports `prompt_embeds` with shape `[batch, sequence, 7680]`.
 
 For a **manual** `olive run` with the same JSON (paths not auto-filled):
 

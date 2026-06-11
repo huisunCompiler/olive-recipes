@@ -305,7 +305,7 @@ def export_prompt_embeds_matmulnbits(
     """Export Flux-compatible prompt_embeds MatMulNBits ONNX.
 
     If ``fp16_onnx_path`` is set, skips PyTorch ONNX export and quantizes that graph instead
-    (e.g. after ``olive run`` with ModelBuilder fp16 + ``hidden_states_layers``).
+    (e.g. after Olive ModelBuilder fp16 + ``hidden_states_layers``).
     """
     model_dir = Path(model_dir).resolve()
     output_path = Path(output_path).resolve()

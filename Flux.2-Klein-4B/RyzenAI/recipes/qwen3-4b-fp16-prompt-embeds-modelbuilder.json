@@ -33,6 +33,6 @@
       }
     }
   },
-  "output_dir": "footprints/text_encoder_olive_mb_fp16",
+  "output_dir": "footprints/text_encoder_fp16_mb",
   "log_severity_level": 1
 }
