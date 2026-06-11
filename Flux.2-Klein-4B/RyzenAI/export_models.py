@@ -19,6 +19,7 @@
 #     scheduler/                     from pipeline
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -35,11 +36,23 @@ DEFAULT_RESOLUTIONS = ["1024x1024"]
 ALL_MODELS = ["transformer", "vae_decoder", "text_encoder"]
 TEXT_ENCODER_BACKENDS = {
     "olive": "config_text_encoder.json",
-    "genai": "config_text_encoder_genai.json",
+    # Olive ModelBuilder fp16 (default recipe) → MatMulNBits INT4; see export_text_encoder_matmulnbits.
+    "genai": None,
+    # Legacy Olive SMP + GPTQ + onnxruntime-genai ModelBuilder path.
+    "genai_olive": "config_text_encoder_genai.json",
 }
+MATMULNBITS_TEXT_ENCODER_BACKENDS = frozenset({"genai"})
 DEFAULT_TEXT_ENCODER_BACKEND = "olive"
+# genai: Olive ModelBuilder fp16 (prompt_embeds) → MatMulNBits INT4; no CLI --run_config required.
+DEFAULT_TEXT_ENCODER_GENAI_OLIVE_RECIPE = (
+    SCRIPT_DIR / "recipes" / "qwen3-4b-fp16-prompt-embeds-modelbuilder.json"
+)
 
 NON_ONNX_COMPONENTS = ["tokenizer", "tokenizer_2", "scheduler", "feature_extractor"]
+
+STAGED_DIR = SCRIPT_DIR / "staged"
+STAGING_MARKER = ".staged_from"
+TEXT_ENCODER_WEIGHT_GLOBS = ("*.safetensors", "*.json")
 
 
 def set_dd_env() -> None:
@@ -74,13 +87,235 @@ def _text_encoder_config_path(backend: str) -> Path:
         raise ValueError(
             f"Unknown text encoder backend '{backend}'. Choices: {', '.join(TEXT_ENCODER_BACKENDS)}"
         )
-    return SCRIPT_DIR / TEXT_ENCODER_BACKENDS[backend]
+    config_name = TEXT_ENCODER_BACKENDS[backend]
+    if config_name is None:
+        raise ValueError(f"Backend '{backend}' does not use an Olive config file.")
+    return SCRIPT_DIR / config_name
+
+
+def _uses_matmulnbits_backend(backend: str) -> bool:
+    return backend in MATMULNBITS_TEXT_ENCODER_BACKENDS
+
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """Symlink large weight files when possible; fall back to copy."""
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    try:
+        os.symlink(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _staging_dir_for_pipeline(pipeline_root: Path) -> Path:
+    digest = hashlib.sha256(str(pipeline_root).encode()).hexdigest()[:12]
+    return STAGED_DIR / f"text_encoder_{digest}"
+
+
+def resolve_pipeline_root(model_id: str | Path) -> Path:
+    """Return the diffusers pipeline root for Flux2KleinPipeline loading."""
+    path = Path(model_id).resolve()
+    if (path / "model_index.json").exists():
+        return path
+    if (path / "text_encoder" / "config.json").exists():
+        return path
+
+    marker = path / STAGING_MARKER
+    if marker.exists():
+        return Path(marker.read_text(encoding="utf-8").strip())
+
+    raise ValueError(
+        f"Cannot resolve diffusers pipeline root from '{path}'. "
+        "Pass --model_id pointing to the FLUX.2-klein-4B pipeline directory."
+    )
+
+
+def stage_text_encoder_bundle(pipeline_root: str | Path) -> Path:
+    """Assemble text_encoder weights + tokenizer into one HF-style directory.
+
+    Diffusers pipelines keep ``text_encoder/`` and ``tokenizer/`` as siblings.
+    Olive's ModelBuilder expects a single checkpoint directory with
+    ``config.json``, weight shards, and tokenizer files together.
+    """
+    pipeline_root = Path(pipeline_root).resolve()
+    text_encoder_src = pipeline_root / "text_encoder"
+    tokenizer_src = pipeline_root / "tokenizer"
+
+    if not text_encoder_src.is_dir():
+        raise FileNotFoundError(f"Missing text_encoder directory: {text_encoder_src}")
+    if not (text_encoder_src / "config.json").exists():
+        raise FileNotFoundError(f"Missing text_encoder config: {text_encoder_src / 'config.json'}")
+    if not tokenizer_src.is_dir():
+        raise FileNotFoundError(f"Missing tokenizer directory: {tokenizer_src}")
+
+    dest = _staging_dir_for_pipeline(pipeline_root)
+    marker = dest / STAGING_MARKER
+    if marker.exists() and marker.read_text(encoding="utf-8").strip() == str(pipeline_root):
+        if (dest / "config.json").exists() and (dest / "tokenizer.json").exists():
+            print(f"  [STAGE] Reusing staged text_encoder bundle: {dest}")
+            return dest
+
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    for pattern in TEXT_ENCODER_WEIGHT_GLOBS:
+        for src_file in sorted(text_encoder_src.glob(pattern)):
+            if src_file.is_file():
+                _link_or_copy(src_file, dest / src_file.name)
+
+    for src_file in sorted(tokenizer_src.iterdir()):
+        if src_file.is_file():
+            _link_or_copy(src_file, dest / src_file.name)
+
+    marker.write_text(str(pipeline_root), encoding="utf-8")
+    print(f"  [STAGE] Assembled text_encoder bundle: {dest}")
+    return dest
+
+
+def _apply_genai_text_encoder_path(cfg: dict, staged_path: Path) -> bool:
+    input_model = cfg.setdefault("input_model", {})
+    changed = False
+    staged = str(staged_path)
+    if input_model.get("model_path") != staged:
+        input_model["model_path"] = staged
+        changed = True
+
+    load_kwargs = input_model.setdefault("load_kwargs", {})
+    extra_args = load_kwargs.get("extra_args")
+    if isinstance(extra_args, dict) and extra_args.pop("subfolder", None) is not None:
+        if not extra_args:
+            load_kwargs.pop("extra_args", None)
+        changed = True
+    return changed
+
+
+def _write_genai_text_encoder_config(staged_path: Path) -> None:
+    config_path = SCRIPT_DIR / TEXT_ENCODER_BACKENDS["genai_olive"]
+    with config_path.open(encoding="utf-8") as f:
+        cfg = json.load(f)
+    if _apply_genai_text_encoder_path(cfg, staged_path):
+        with config_path.open("w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+        print(f"  [CONFIG] Updated {config_path.name} -> {staged_path}")
+
+
+def prepare_genai_text_encoder(pipeline_root: str | Path, *, update_olive_config: bool = False) -> Path:
+    """Stage a flat HF checkpoint directory for text encoder export."""
+    staged_path = stage_text_encoder_bundle(pipeline_root)
+    if update_olive_config:
+        _write_genai_text_encoder_config(staged_path)
+    return staged_path
+
+
+def _write_text_encoder_footprint(footprint_dir: Path) -> None:
+    """Write a minimal Olive footprint so assemble_output_dir can copy model.onnx."""
+    footprint_dir.mkdir(parents=True, exist_ok=True)
+    node_id = "matmulnbits_export"
+    footprint = {
+        node_id: {
+            "parent_model_id": None,
+            "model_id": node_id,
+            "model_config_data": {
+                "type": "onnxmodel",
+                "config": {
+                    "model_path": str(footprint_dir),
+                    "onnx_file_name": "model.onnx",
+                },
+            },
+            "from_pass": "onnxconversion",
+        }
+    }
+    with (footprint_dir / "footprint.json").open("w", encoding="utf-8") as f:
+        json.dump(footprint, f, indent=4)
+
+
+def _find_latest_model_onnx(search_root: Path) -> Path:
+    """Pick the most recently modified ``model.onnx`` under an Olive output tree."""
+    candidates = list(search_root.rglob("model.onnx"))
+    if not candidates:
+        raise FileNotFoundError(f"No model.onnx found under {search_root}")
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _run_olive_fp16_prompt_embed_modelbuilder(staged_model_dir: Path, run_config: Path) -> Path:
+    """Run Olive ModelBuilder (fp16, prompt_embeds) and return path to ``model.onnx``."""
+    run_config = run_config.resolve()
+    if not run_config.is_file():
+        raise FileNotFoundError(f"Olive run config not found: {run_config}")
+
+    with run_config.open(encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    input_model = cfg.setdefault("input_model", {})
+    input_model["model_path"] = str(staged_model_dir.resolve())
+    load_kw = input_model.setdefault("load_kwargs", {})
+    load_kw.setdefault("trust_remote_code", True)
+
+    out_rel = cfg.get("output_dir", "footprints/text_encoder_olive_mb_fp16")
+    olive_out = Path(out_rel)
+    if not olive_out.is_absolute():
+        olive_out = (SCRIPT_DIR / olive_out).resolve()
+    cfg["output_dir"] = str(olive_out)
+    olive_out.mkdir(parents=True, exist_ok=True)
+
+    sidecar = olive_out / "_export_models_olive_run_config.json"
+    with sidecar.open("w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"  [OLIVE] ModelBuilder fp16 (prompt_embeds): effective config → {sidecar}")
+
+    olive_run(cfg)
+    fp16_onnx = _find_latest_model_onnx(olive_out)
+    print(f"  [OLIVE] fp16 ONNX: {fp16_onnx}")
+    return fp16_onnx
+
+
+def export_text_encoder_matmulnbits(
+    staged_model_dir: Path,
+    *,
+    fp16_onnx_path: Path | None = None,
+    olive_run_config: Path | None = None,
+) -> Path:
+    """genai text encoder: Olive ModelBuilder fp16 (default recipe) → MatMulNBits INT4.
+
+    ``fp16_onnx_path``: skip Olive and quantize this ONNX.
+    ``olive_run_config``: override the built-in Olive JSON (default:
+    ``DEFAULT_TEXT_ENCODER_GENAI_OLIVE_RECIPE``). Ignored when ``fp16_onnx_path`` is set.
+    """
+    from text_encoder_matmulnbits import export_prompt_embeds_matmulnbits
+
+    if fp16_onnx_path is not None and olive_run_config is not None:
+        raise ValueError(
+            "Do not pass both fp16_onnx_path and olive_run_config. "
+            "Use --text_encoder_fp16_onnx alone, or omit it to run Olive (default or --text_encoder_olive_run_config)."
+        )
+
+    if fp16_onnx_path is not None:
+        resolved_fp16 = fp16_onnx_path
+    else:
+        recipe = olive_run_config or DEFAULT_TEXT_ENCODER_GENAI_OLIVE_RECIPE
+        recipe = Path(recipe).resolve()
+        if not recipe.is_file():
+            raise FileNotFoundError(
+                f"genai Olive recipe not found: {recipe}. "
+                "Restore recipes/ in this package or pass --text_encoder_olive_run_config."
+            )
+        print(f"  [GENAI] Using Olive recipe: {recipe}")
+        resolved_fp16 = _run_olive_fp16_prompt_embed_modelbuilder(staged_model_dir, recipe)
+
+    footprint_dir = SCRIPT_DIR / "footprints" / "text_encoder"
+    output_onnx = footprint_dir / "model.onnx"
+    export_prompt_embeds_matmulnbits(staged_model_dir, output_onnx, fp16_onnx_path=resolved_fp16)
+    _write_text_encoder_footprint(footprint_dir)
+    return output_onnx
 
 
 def _config_paths_for_update(models: list[str], text_encoder_backend: str) -> list[Path]:
     paths: list[Path] = []
     for name in models:
         if name == "text_encoder":
+            if _uses_matmulnbits_backend(text_encoder_backend):
+                continue
             paths.append(_text_encoder_config_path(text_encoder_backend))
         else:
             paths.append(SCRIPT_DIR / f"config_{name}.json")
@@ -100,9 +335,13 @@ def update_config_files(
             cfg = json.load(f)
 
         changed = False
-        if model_id is not None and cfg.get("input_model", {}).get("model_path") != model_id:
-            cfg["input_model"]["model_path"] = model_id
-            changed = True
+        if model_id is not None:
+            if config_path.name == TEXT_ENCODER_BACKENDS["genai_olive"]:
+                pipeline_root = resolve_pipeline_root(model_id)
+                changed |= _apply_genai_text_encoder_path(cfg, prepare_genai_text_encoder(pipeline_root, update_olive_config=False))
+            elif cfg.get("input_model", {}).get("model_path") != model_id:
+                cfg["input_model"]["model_path"] = model_id
+                changed = True
         if resolutions is not None:
             for pass_cfg in cfg.get("passes", {}).values():
                 if "resolutions" in pass_cfg and pass_cfg["resolutions"] != resolutions:
@@ -117,10 +356,12 @@ def update_config_files(
 
 def load_olive_config(submodel_name: str, text_encoder_backend: str = DEFAULT_TEXT_ENCODER_BACKEND) -> dict:
     if submodel_name == "text_encoder":
+        if _uses_matmulnbits_backend(text_encoder_backend):
+            raise ValueError(f"Backend '{text_encoder_backend}' does not use Olive configs.")
         config_path = _text_encoder_config_path(text_encoder_backend)
     else:
         config_path = SCRIPT_DIR / f"config_{submodel_name}.json"
-    with config_path.open() as f:
+    with config_path.open(encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -376,12 +617,31 @@ def optimize(args) -> dict[str, bool]:
         print(f"\n{'=' * 60}\n  Exporting: {submodel_name}\n{'=' * 60}")
         backend = args.text_encoder_backend if submodel_name == "text_encoder" else DEFAULT_TEXT_ENCODER_BACKEND
         if submodel_name == "text_encoder":
-            print(f"  text_encoder backend: {backend} ({TEXT_ENCODER_BACKENDS[backend]})")
-        olive_config = load_olive_config(submodel_name, text_encoder_backend=backend)
+            print(f"  text_encoder backend: {backend} ({TEXT_ENCODER_BACKENDS.get(backend, 'matmulnbits')})")
         t0 = time.monotonic()
         try:
-            olive_run(olive_config)
-            success = True
+            if submodel_name == "text_encoder" and _uses_matmulnbits_backend(backend):
+                staged_path = prepare_genai_text_encoder(resolve_pipeline_root(model_id))
+                fp16_onnx = (
+                    Path(args.text_encoder_fp16_onnx).resolve()
+                    if getattr(args, "text_encoder_fp16_onnx", None)
+                    else None
+                )
+                olive_rc = (
+                    Path(args.text_encoder_olive_run_config).resolve()
+                    if getattr(args, "text_encoder_olive_run_config", None)
+                    else None
+                )
+                export_text_encoder_matmulnbits(
+                    staged_path,
+                    fp16_onnx_path=fp16_onnx,
+                    olive_run_config=olive_rc,
+                )
+                success = True
+            else:
+                olive_config = load_olive_config(submodel_name, text_encoder_backend=backend)
+                olive_run(olive_config)
+                success = True
         except Exception as exc:
             print(f"\n[ERROR] {submodel_name} export failed: {exc}")
             success = False
@@ -451,9 +711,31 @@ def parse_args(raw_args=None) -> argparse.Namespace:
         choices=sorted(TEXT_ENCODER_BACKENDS),
         default=DEFAULT_TEXT_ENCODER_BACKEND,
         help=(
-            "Text encoder export backend. 'olive' uses OnnxConversion + ORT optimization "
-            "(default). 'genai' uses Olive ModelBuilder with prompt_embeds export "
-            "(requires CUDA GPU and matching onnxruntime-genai / Olive PR changes)."
+            "Text encoder export backend. "
+            "'olive' = OnnxConversion + ORT optimization (default). "
+            "'genai' = Olive ModelBuilder fp16 (built-in recipe) → MatMulNBits INT4 prompt_embeds ONNX. "
+            "'genai_olive' = legacy Olive SMP + GPTQ + ModelBuilder path."
+        ),
+    )
+    parser.add_argument(
+        "--text_encoder_fp16_onnx",
+        default=None,
+        type=str,
+        metavar="PATH",
+        help=(
+            "Only with --text_encoder_backend genai: use this fp16 model.onnx instead of running Olive. "
+            "MatMul → MatMulNBits INT4 only. Mutually exclusive with --text_encoder_olive_run_config."
+        ),
+    )
+    parser.add_argument(
+        "--text_encoder_olive_run_config",
+        default=None,
+        type=str,
+        metavar="PATH",
+        help=(
+            "Only with --text_encoder_backend genai: override the built-in Olive JSON "
+            f"(default: {DEFAULT_TEXT_ENCODER_GENAI_OLIVE_RECIPE.name}). "
+            "Mutually exclusive with --text_encoder_fp16_onnx."
         ),
     )
     return parser.parse_args(raw_args)
@@ -462,6 +744,11 @@ def parse_args(raw_args=None) -> argparse.Namespace:
 def main(raw_args=None) -> None:
     set_dd_env()
     args = parse_args(raw_args)
+
+    if args.text_encoder_fp16_onnx and args.text_encoder_olive_run_config:
+        raise SystemExit(
+            "Use at most one of --text_encoder_fp16_onnx and --text_encoder_olive_run_config."
+        )
 
     if args.models:
         args.models = [m for m in ALL_MODELS if m in args.models]
@@ -473,9 +760,31 @@ def main(raw_args=None) -> None:
         update_config_files(args.model_id, args.resolutions, args.models, args.text_encoder_backend)
 
     if args.model_id is None:
-        first_cfg_path = SCRIPT_DIR / f"config_{args.models[0]}.json"
-        with first_cfg_path.open() as f:
-            args.model_id = json.load(f)["input_model"]["model_path"]
+        if "text_encoder" in args.models and _uses_matmulnbits_backend(args.text_encoder_backend):
+            args.model_id = str(DEFAULT_MODEL_ID)
+        elif "text_encoder" in args.models:
+            cfg_path = _text_encoder_config_path(args.text_encoder_backend)
+            with cfg_path.open(encoding="utf-8") as f:
+                args.model_id = json.load(f)["input_model"]["model_path"]
+        else:
+            cfg_path = SCRIPT_DIR / f"config_{args.models[0]}.json"
+            with cfg_path.open(encoding="utf-8") as f:
+                args.model_id = json.load(f)["input_model"]["model_path"]
+
+    pipeline_root = resolve_pipeline_root(args.model_id)
+
+    if "text_encoder" in args.models and (
+        _uses_matmulnbits_backend(args.text_encoder_backend)
+        or args.text_encoder_backend == "genai_olive"
+    ):
+        print("\n[STAGE] Preparing flat text_encoder bundle ...")
+        staged_path = prepare_genai_text_encoder(
+            pipeline_root,
+            update_olive_config=args.text_encoder_backend == "genai_olive",
+        )
+        print(f"  text_encoder bundle: {staged_path}")
+        print(f"  pipeline model_id  : {pipeline_root}")
+        args.model_id = str(pipeline_root)
 
     if args.resolutions is None:
         args.resolutions = DEFAULT_RESOLUTIONS
@@ -496,7 +805,15 @@ def main(raw_args=None) -> None:
     print(f"  model_id    : {args.model_id}")
     print(f"  sub-models  : {', '.join(args.models)}")
     if "text_encoder" in args.models:
-        print(f"  text_encoder: {args.text_encoder_backend} ({TEXT_ENCODER_BACKENDS[args.text_encoder_backend]})")
+        backend_label = TEXT_ENCODER_BACKENDS.get(args.text_encoder_backend) or "matmulnbits"
+        print(f"  text_encoder: {args.text_encoder_backend} ({backend_label})")
+        if args.text_encoder_backend == "genai":
+            if args.text_encoder_fp16_onnx:
+                print(f"  text_encoder fp16: existing ONNX → {args.text_encoder_fp16_onnx}")
+            elif args.text_encoder_olive_run_config:
+                print(f"  text_encoder fp16: Olive (custom recipe) → {args.text_encoder_olive_run_config}")
+            else:
+                print(f"  text_encoder fp16: Olive (default) → {DEFAULT_TEXT_ENCODER_GENAI_OLIVE_RECIPE}")
     print(f"  resolutions : {', '.join(args.resolutions)}")
     print(f"  output_dir  : {args.output_dir}")
     print("=" * 60)
